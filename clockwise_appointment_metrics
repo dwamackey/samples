@@ -1,0 +1,211 @@
+import requests
+import json
+import pandas as pd
+from datetime import datetime, timedelta, date, timedelta
+import time
+from google.cloud import storage
+from google.cloud import bigquery
+
+def bq_create_dataset(bigquery_client, dataset):
+    dataset_ref = bigquery_client.dataset(dataset)
+    try:
+        dataset = bigquery_client.get_dataset(dataset_ref)
+        print('Dataset {} already exists.'.format(dataset))
+    except NotFound:
+        dataset = bigquery.Dataset(dataset_ref)
+        dataset.location = 'US'
+        dataset = bigquery_client.create_dataset(dataset)
+        print('Dataset {} created.'.format(dataset.dataset_id))
+    return dataset
+
+#Function to create a dataset in Table
+def bq_create_table(bigquery_client, dataset, table_name):
+    dataset_ref = bigquery_client.dataset(dataset)
+
+    # Prepares a reference to the table
+    table_ref = dataset_ref.table(table_name)
+
+    try:
+        table =  bigquery_client.get_table(table_ref)
+        print('table {} already exists.'.format(table))
+    except NotFound:
+        schema = [
+            bigquery.SchemaField('report_date', 'STRING', mode='REQUIRED'),
+            bigquery.SchemaField('group_name', 'STRING', mode='REQUIRED'),
+            bigquery.SchemaField('group_id', 'STRING', mode='REQUIRED'),
+            bigquery.SchemaField('hospital_name', 'STRING', mode='REQUIRED'),
+            bigquery.SchemaField('hospital_id', 'STRING', mode='REQUIRED'),
+            bigquery.SchemaField('entry_type', 'STRING', mode='REQUIRED'),
+            bigquery.SchemaField('all_appointments_count', 'INTEGER', mode='REQUIRED'),
+            bigquery.SchemaField('cancelled_count', 'INTEGER', mode='REQUIRED'),
+            bigquery.SchemaField('removed_count', 'INTEGER', mode='REQUIRED'),
+        ]
+        table = bigquery.Table(table_ref, schema=schema)
+        table = bigquery_client.create_table(table)
+        print('table {} created.'.format(table.table_id))
+    return table
+
+def bq_remove_partitions(bigquery_client, dataset, table_name, run_date):
+    query_job = bigquery_client.query(
+        f"""
+        DELETE {dataset}.{table_name}
+        WHERE report_date = '{run_date}'
+        """
+    )
+    results = query_job.result()  # Waits for job to complete.
+    return results
+
+def bq_create_view(bigquery_client, dataset, table_name):
+    query_job = bigquery_client.query(
+        f"""
+        CREATE VIEW IF NOT EXISTS clockwise.weekly_summary_metrics_view AS
+        SELECT
+        DATE_TRUNC(report_date, WEEK(SUNDAY)) AS week_date,
+        IF(group_id='None',hospital_id,group_id) AS group_id,
+        IF(group_name='None',hospital_name,group_name) AS group_name,
+        SUM(all_appointments_count) - SUM(cancelled_count) - SUM(removed_count) AS total_appointments,
+        SUM(IF(entry_type='Online',all_appointments_count - cancelled_count - removed_count,0)) AS online_appointments,
+        SUM(IF(entry_type='Online',cancelled_count + removed_count,0)) AS leakage
+        FROM `{dataset}.{table_name}}`
+        GROUP BY 1,2,3;
+        """
+    )
+    results = query_job.result()  # Waits for job to complete.
+    return results
+
+def bq_load_data(bigquery_client, dataset, table_name, df):
+    job_config = bigquery.LoadJobConfig(
+        schema=[
+            bigquery.SchemaField('report_date', bigquery.enums.SqlTypeNames.DATE),
+            bigquery.SchemaField('group_name', bigquery.enums.SqlTypeNames.STRING),
+            bigquery.SchemaField('group_id', bigquery.enums.SqlTypeNames.STRING),
+            bigquery.SchemaField('hospital_name', bigquery.enums.SqlTypeNames.STRING),
+            bigquery.SchemaField('hospital_id', bigquery.enums.SqlTypeNames.STRING),
+            bigquery.SchemaField('entry_type', bigquery.enums.SqlTypeNames.STRING),
+            bigquery.SchemaField('all_appointments_count', bigquery.enums.SqlTypeNames.INTEGER),
+            bigquery.SchemaField('cancelled_count', bigquery.enums.SqlTypeNames.INTEGER),
+            bigquery.SchemaField('removed_count', bigquery.enums.SqlTypeNames.INTEGER),
+        ],
+        write_disposition="WRITE_APPEND",
+    )
+    load_job = bigquery_client.load_table_from_dataframe(df, dataset+'.'+table_name, job_config=job_config)
+    destination_table = bigquery_client.get_table(dataset+'.'+table_name)
+    return destination_table
+
+def clockwise_get_groups(group_type,auth_token):
+    url = f'https://api.clockwisemd.com/v1/{group_type}'
+    headers = {
+        'Accept': 'application/json',
+        'Authtoken': auth_token,
+    }
+    params = {
+        'details': 'true',
+    }
+    response = requests.get(url, params=params, headers=headers)
+    data = response.json()
+    return data
+
+def clockwise_get_group_metrics(run_date,group,auth_token):
+    formatted_date = run_date.strftime('%Y%m%d')
+    url = f'https://api.clockwisemd.com/v1/hospitals/{group}/appointments/date/{formatted_date}'
+    headers = {
+        'Accept': 'application/json',
+        'Authtoken': auth_token,
+    }
+    params = {
+        'details': 'true',
+    }
+    response = requests.get(url, params=params, headers=headers)
+    data = response.json()
+    return data
+
+def write_metrics_array(metrics_data,dict_group,group_metric_types):
+    dict_metrics = {}
+    for metric in metrics_data:
+        if metric in group_metric_types:
+            dict_metrics.update({metric:metrics_data[metric]})
+    myKeys = list(dict_metrics.keys())
+    myKeys.sort()
+    dict_metrics = {i: dict_metrics[i] for i in myKeys}
+    dict_group_metrics = {**dict_group, **dict_metrics}
+    return dict_group_metrics
+                
+def start_function(event,context):
+    #Get auth_token from Clockwise
+    auth_token = '{AUTH_TOKEN}'
+    #Array pulls both hospital and group types
+    group_types = ['hospitals','groups']
+    #List of metrics we want to pull from API
+    group_metric_types = ['apt_time','cancelled_at','entry_type','removed_at']
+
+    ### Create array of dates so we can pull multiple dates
+    run_start_dt = datetime.strptime(str(date.today() - timedelta(days=7)), "%Y-%m-%d").date()
+    run_end_dt = datetime.strptime(str(date.today() - timedelta(days=1)), "%Y-%m-%d").date()
+    date_range = [run_start_dt + timedelta(days=x) for x in range(0, (run_end_dt-run_start_dt).days+1)]
+
+    print('#######################################')
+    print('Start function')
+    
+    ###### Creating bigquery object and remove past partition for report_date ######
+    bigquery_client = bigquery.Client()
+    dataset = '{DATASET_NAME}'
+    table_name = '{TABLE_NAME}'
+    data = bq_create_dataset(bigquery_client, dataset)
+    table = bq_create_table(bigquery_client, dataset, table_name)
+    
+    ######  Fetch data from API  ######
+    for run_date in date_range:
+        print(f'Removing date partition from table for {run_date} so no dupes')
+        bq_remove_partitions(bigquery_client, dataset, table_name,run_date)
+        print(f'Getting data for {run_date}')
+        group_metrics_array = []
+        for group_type in group_types:
+            data = clockwise_get_groups(group_type,auth_token)
+            for i in data:
+                if group_type == 'groups':
+                    for j in i['hospitals']:
+                        dict_group = {
+                            'report_date':run_date,
+                            'group_id':str(i['id']),
+                            'group_name':str(i['name']),
+                            'group_type':str(group_type),
+                            'hospital_id':str(j['id']),    
+                            'hospital_name':str(j['name']),
+                        }     
+                        metrics_data = clockwise_get_group_metrics(run_date,dict_group['hospital_id'],auth_token)
+                        for k in metrics_data:
+                            dict_group_metrics = write_metrics_array(k,dict_group,group_metric_types)
+                            group_metrics_array.append(dict_group_metrics)
+
+                if group_type == 'hospitals':
+                    if i['group_id'] == None:
+                        dict_group = {
+                            'report_date':run_date,
+                            'group_id':str(i['group_id']),
+                            'group_name':str(None),
+                            'group_type':str(group_type),
+                            'hospital_id':str(i['id']),    
+                            'hospital_name':str(i['name']),
+                        }
+                        metrics_data = clockwise_get_group_metrics(run_date,dict_group['hospital_id'],auth_token)
+                        for j in metrics_data:
+                            dict_group_metrics = write_metrics_array(j,dict_group,group_metric_types)
+                            group_metrics_array.append(dict_group_metrics)
+        df = pd.DataFrame(group_metrics_array)
+        df = df.groupby([str('report_date'),str('group_name'),str('group_id'),str('hospital_name'),str('hospital_id'),str('entry_type')]).aggregate({'entry_type':'count','cancelled_at':'count','removed_at':'count'})
+        df = df.rename(columns={'entry_type':'all_appointments_count','cancelled_at':'cancelled_count','removed_at':'removed_count'})
+
+
+    ######  Upload data to BigQuery  ######
+        print(f'{len(df)} rows pulled to upload to BigQuery')
+        print('Uploading data to BigQuery')
+        destination_table = bq_load_data(bigquery_client, dataset, table_name, df)
+        print(f'Loaded {destination_table.num_rows} rows and {len(destination_table.schema)} columns to {table_name}')
+        bq_create_view(bigquery_client)
+        print(f'Finished uploading for {run_date}')
+    print(f'End function')
+    print('#######################################')
+    return df
+
+
+df = start_function(1,2)
